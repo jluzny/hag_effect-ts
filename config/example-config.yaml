@@ -1,0 +1,56 @@
+# HAG HVAC Automation - Example Configuration
+# Copy this file to config.yaml and adjust settings for your setup
+
+appOptions:
+  logLevel: "info"          # debug, info, warning, error
+  useAi: false              # Enable AI agent for intelligent HVAC decisions
+  aiModel: "gpt-4o-mini"    # OpenAI model to use
+  aiTemperature: 0.1        # AI model temperature (0.0 = deterministic, 2.0 = creative)
+  openaiApiKey: "${OPENAI_API_KEY}"  # Set via environment variable
+
+hassOptions:
+  wsUrl: "ws://localhost:8123/api/websocket"
+  restUrl: "http://localhost:8123"
+  token: "${HASS_TOKEN}"    # Home Assistant long-lived access token
+  maxRetries: 3
+  retryDelayMs: 1000
+
+hvacOptions:
+  tempSensor: "sensor.indoor_temperature"
+  outdoorSensor: "sensor.openweathermap_temperature"
+  systemMode: "auto"        # auto, heat_only, cool_only, off
+  
+  hvacEntities:
+    - entityId: "climate.living_room_ac"
+      enabled: true
+      defrost: true
+    - entityId: "climate.bedroom_ac"
+      enabled: true
+      defrost: false
+      
+  heating:
+    temperature: 21.0
+    presetMode: "comfort"
+    temperatureThresholds:
+      indoorMin: 19.7
+      indoorMax: 20.2
+      outdoorMin: -10.0
+      outdoorMax: 15.0
+    defrost:
+      temperatureThreshold: 0.0
+      periodSeconds: 3600
+      duration_seconds: 300
+      
+  cooling:
+    temperature: 24.0
+    presetMode: "windFree"
+    temperatureThresholds:
+      indoorMin: 23.5
+      indoorMax: 25.0
+      outdoorMin: 10.0
+      outdoorMax: 45.0
+      
+  activeHours:
+    start: 8
+    startWeekday: 7
+    end: 21

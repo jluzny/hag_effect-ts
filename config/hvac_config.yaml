@@ -1,0 +1,63 @@
+# HAG Effect-TS Variant - Example Configuration
+# Home Assistant aGentic HVAC automation configuration
+
+# Application-level settings
+appOptions:
+  logLevel: info
+  useAi: false  # Set to true to enable AI agent (requires OpenAI API key)
+  aiModel: gpt-3.5-turbo
+  aiTemperature: 0.1
+
+# Home Assistant connection settings
+hassOptions:
+  wsUrl: ws://localhost:8123/api/websocket
+  restUrl: http://localhost:8123
+  token: your_long_lived_access_token_here
+  maxRetries: 5
+  retryDelayMs: 1000
+  stateCheckInterval: 300000  # 5 minutes
+
+# HVAC system configuration
+hvacOptions:
+  tempSensor: sensor.indoor_temperature
+  outdoorSensor: sensor.openweathermap_temperature
+  systemMode: auto  # auto, heat_only, cool_only, off
+
+  # HVAC entities to control
+  hvacEntities:
+    - entityId: climate.living_room_ac
+      enabled: true
+      defrost: true
+    - entityId: climate.bedroom_ac
+      enabled: true
+      defrost: false
+
+  # Heating configuration
+  heating:
+    temperature: 21.0
+    presetMode: comfort
+    temperatureThresholds:
+      indoorMin: 19.7
+      indoorMax: 20.2
+      outdoorMin: -10.0
+      outdoorMax: 15.0
+    defrost:
+      temperatureThreshold: 0.0
+      periodSeconds: 3600    # 1 hour
+      durationSeconds: 300   # 5 minutes
+
+  # Cooling configuration
+  cooling:
+    temperature: 24.0
+    presetMode: windFree
+    temperatureThresholds:
+      indoorMin: 23.5
+      indoorMax: 25.0
+      outdoorMin: 10.0
+      outdoorMax: 45.0
+
+  # Active hours (when HVAC can operate)
+  activeHours:
+    start: 8        # 8 AM
+    startWeekday: 7 # 7 AM on weekdays
+    end: 21         # 9 PM
