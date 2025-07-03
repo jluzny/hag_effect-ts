@@ -4,20 +4,18 @@
  * CLI application using @effect/cli with Effect-native patterns.
  */
 
-import { Effect, Context, Layer, pipe, Exit } from 'effect';
+import { Effect, pipe } from 'effect';
 import { Command, Args, Options } from '@effect/cli';
-import { Terminal } from '@effect/terminal';
 import { NodeContext, NodeRuntime } from '@effect/platform-node';
-import { createContainer, disposeContainer, ApplicationContainer } from './core/container.ts';
+import { createContainer as _createContainer, ApplicationContainer as _ApplicationContainer, MainLayer } from './core/container.ts';
 import { HVACController } from './hvac/controller.ts';
 import { ConfigLoader } from './config/loader.ts';
-import { LoggerService } from './core/container.ts';
-import { ErrorUtils } from './core/exceptions.ts';
+import process from "node:process";
 
 /**
  * Global container reference
  */
-let container: ApplicationContainer | undefined;
+let _container: _ApplicationContainer | undefined;
 
 /**
  * Cleanup handler
@@ -25,9 +23,9 @@ let container: ApplicationContainer | undefined;
 const cleanup = (): Effect.Effect<void, never> =>
   pipe(
     Effect.gen(function* () {
-      if (container) {
-        yield* container.dispose();
-        container = undefined;
+      if (_container) {
+        yield* _container.dispose();
+        _container = undefined;
       }
     }),
     Effect.catchAll(() => Effect.void)
@@ -37,7 +35,7 @@ const cleanup = (): Effect.Effect<void, never> =>
  * Setup cleanup handlers
  */
 const setupCleanup = (): Effect.Effect<void, never> =>
-  Effect.gen(function* () {
+  Effect.sync(() => {
     // Handle process termination
     process.on('SIGINT', () => {
       console.log('\n🛑 Received SIGINT, shutting down gracefully...');
@@ -64,20 +62,26 @@ const setupCleanup = (): Effect.Effect<void, never> =>
 /**
  * Run HAG application
  */
-const runApplication = (configPath?: string): Effect.Effect<void, never> =>
+const runApplication = (configPath?: string) =>
   pipe(
     Effect.gen(function* () {
       // Setup cleanup handlers
       yield* setupCleanup();
       
-      // Create and initialize container
-      container = yield* createContainer(configPath);
+      // Set config path if provided
+      if (configPath) {
+        Deno.env.set('HAG_CONFIG_FILE', configPath);
+      }
+      // Set log level if provided
+      if (logLevel) {
+        Deno.env.set('HAG_LOG_LEVEL', logLevel);
+      }
       
       // Get HVAC controller
-      const controller = yield* container.getService(HVACController);
+      const controller = yield* HVACController;
       
       // Start the controller
-      yield* controller.start;
+      yield* controller.start();
       
       yield* Effect.log('🏠 HAG HVAC automation is running...');
       yield* Effect.log('📊 Press Ctrl+C to stop gracefully');
@@ -139,16 +143,18 @@ const validateConfig = (configPath: string): Effect.Effect<void, never> =>
 /**
  * Get system status
  */
-const getStatus = (configPath?: string): Effect.Effect<void, never> =>
+const getStatus = (configPath?: string) =>
   pipe(
     Effect.gen(function* () {
-      container = yield* createContainer(configPath);
-      const controller = yield* container.getService(HVACController);
+      if (configPath) {
+        Deno.env.set('HAG_CONFIG_FILE', configPath);
+      }
+      const controller = yield* HVACController;
       
       // Start controller briefly to get status
-      yield* controller.start;
-      const status = yield* controller.getStatus;
-      yield* controller.stop;
+      yield* controller.start();
+      const status = yield* controller.getStatus();
+      yield* controller.stop();
       
       yield* Effect.log('\n📊 HAG System Status');
       yield* Effect.log('=' + '='.repeat(29));
@@ -195,13 +201,15 @@ const manualOverride = (
   action: string,
   configPath?: string,
   temperature?: number
-): Effect.Effect<void, never> =>
+) =>
   pipe(
     Effect.gen(function* () {
-      container = yield* createContainer(configPath);
-      const controller = yield* container.getService(HVACController);
+      if (configPath) {
+        Deno.env.set('HAG_CONFIG_FILE', configPath);
+      }
+      const controller = yield* HVACController;
       
-      yield* controller.start;
+      yield* controller.start();
       
       const options: Record<string, unknown> = {};
       if (temperature !== undefined) {
@@ -220,7 +228,7 @@ const manualOverride = (
         yield* Effect.die('Manual override failed');
       }
       
-      yield* controller.stop;
+      yield* controller.stop();
     }),
     Effect.catchAll((error) =>
       pipe(
@@ -273,51 +281,54 @@ const temperatureOption = Options.integer('temperature').pipe(
 
 // Main run command
 const runCommand = Command.make('run', {
-  options: Effect.struct({
+  options: {
     config: configOption,
     logLevel: logLevelOption,
-  }),
+  },
 }).pipe(
   Command.withDescription('Run HAG HVAC automation'),
-  Command.withHandler(({ config }) => runApplication(config))
+  Command.withHandler((args) => runApplication(
+    args.options.config._tag === 'Some' ? args.options.config.value : undefined,
+    args.options.logLevel._tag === 'Some' ? args.options.logLevel.value : undefined
+  ))
 );
 
 // Validate configuration command
 const validateCommand = Command.make('validate', {
-  options: Effect.struct({
+  options: {
     config: Options.file('config').pipe(
       Options.withAlias('c'),
       Options.withDescription('Configuration file path')
     ),
-  }),
+  },
 }).pipe(
   Command.withDescription('Validate configuration file'),
-  Command.withHandler(({ config }) => validateConfig(config))
+  Command.withHandler((args) => validateConfig(args.options.config))
 );
 
 // Status command
 const statusCommand = Command.make('status', {
-  options: Effect.struct({
+  options: {
     config: configOption,
-  }),
+  },
 }).pipe(
   Command.withDescription('Get system status'),
-  Command.withHandler(({ config }) => getStatus(config))
+  Command.withHandler((args) => getStatus(args.options.config._tag === 'Some' ? args.options.config.value : undefined))
 );
 
 // Manual override command
 const overrideCommand = Command.make('override', {
-  args: Args.text('action').pipe(
+  args: Args.text({ name: 'action' }).pipe(
     Args.withDescription('HVAC action (heat, cool, off)')
   ),
-  options: Effect.struct({
+  options: {
     config: configOption,
     temperature: temperatureOption,
-  }),
+  },
 }).pipe(
   Command.withDescription('Manual HVAC override'),
-  Command.withHandler(({ action }, { config, temperature }) => 
-    manualOverride(action, config, temperature)
+  Command.withHandler((parsed) => 
+    manualOverride(parsed.args as string, parsed.options.config._tag === 'Some' ? parsed.options.config.value : undefined, parsed.options.temperature._tag === 'Some' ? parsed.options.temperature.value : undefined)
   )
 );
 
@@ -344,16 +355,15 @@ const cli = Command.make('hag').pipe(
 /**
  * Main application entry point
  */
-const main: Effect.Effect<void, never> = pipe(
-  cli,
-  Command.run({
+const main = (args: ReadonlyArray<string>) => pipe(
+  Command.run(cli, {
     name: 'HAG Effect-TS',
     version: '1.0.0',
-  }),
-  Effect.provide(NodeContext.layer),
-  Effect.catchAll((error) =>
+  })(args),
+  Effect.provide(MainLayer),
+  Effect.catchAllCause((cause) =>
     pipe(
-      Effect.logError('❌ CLI error', { error }),
+      Effect.logError('❌ CLI error', { cause }),
       Effect.andThen(cleanup()),
       Effect.andThen(Effect.die('CLI error'))
     )
@@ -362,15 +372,17 @@ const main: Effect.Effect<void, never> = pipe(
 
 // Run the CLI
 if (import.meta.main) {
-  pipe(
-    main,
-    Effect.catchAll((error) =>
+  const program = pipe(
+    main(Deno.args),
+    Effect.provide(NodeContext.layer),
+    Effect.catchAllCause((cause) =>
       pipe(
-        Effect.logError('❌ Application error', { error }),
+        Effect.logError('❌ Application error', { cause }),
         Effect.andThen(cleanup()),
         Effect.andThen(Effect.succeed(undefined))
       )
-    ),
-    NodeRuntime.runMain
+    )
   );
+  
+  NodeRuntime.runMain(program as Effect.Effect<void, never, never>);
 }

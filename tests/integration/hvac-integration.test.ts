@@ -6,9 +6,9 @@
  */
 
 import { assertEquals, assertExists, assertInstanceOf } from '@std/assert';
-import { Effect, Context, Layer, Ref, Exit, pipe } from 'effect';
+import { Effect, Context as _Context, Layer, Ref, Exit, pipe } from 'effect';
 import { 
-  createContainer, 
+  createContainer as _createContainer, 
   ApplicationContainer,
   SettingsService,
   HvacOptionsService,
@@ -19,7 +19,7 @@ import { HVACController } from '../../src/hvac/controller.ts';
 import { HVACStateMachine } from '../../src/hvac/state-machine.ts';
 import { HomeAssistantClient } from '../../src/home-assistant/client.ts';
 import { HVACMode, SystemMode, LogLevel } from '../../src/types/common.ts';
-import { Settings } from '../../src/config/settings.ts';
+import { Settings } from '../../src/config/settings_simple.ts';
 import { ErrorUtils } from '../../src/core/exceptions.ts';
 
 // Mock configuration for testing
@@ -29,6 +29,7 @@ const mockSettings: Settings = {
     useAi: false,
     aiModel: 'gpt-4o-mini',
     aiTemperature: 0.1,
+    openaiApiKey: 'test_key', // Added missing property
   },
   hassOptions: {
     wsUrl: 'ws://localhost:8123/api/websocket',
@@ -36,6 +37,7 @@ const mockSettings: Settings = {
     token: 'test_token',
     maxRetries: 1,
     retryDelayMs: 100,
+    stateCheckInterval: 5000, // Added missing property
   },
   hvacOptions: {
     tempSensor: 'sensor.indoor_temperature',
@@ -45,7 +47,6 @@ const mockSettings: Settings = {
       {
         entityId: 'climate.test_ac',
         enabled: true,
-        defrost: false,
       },
     ],
     heating: {
@@ -252,15 +253,15 @@ Deno.test('Effect-TS HVAC Integration Tests', async (t) => {
       const haClient = yield* HomeAssistantClient;
 
       // Test controller-client integration
-      yield* controller.start;
+      yield* controller.start();
       const connected = yield* haClient.connected;
       assertEquals(connected, true);
 
-      const status = yield* controller.getStatus;
+      const status = yield* controller.getStatus();
       assertEquals(status.controller.running, true);
       assertEquals(status.controller.haConnected, true);
 
-      yield* controller.stop;
+      yield* controller.stop();
       const disconnected = yield* haClient.connected;
       assertEquals(disconnected, false);
 
@@ -279,7 +280,7 @@ Deno.test('Effect-TS HVAC Integration Tests', async (t) => {
     const effect = Effect.gen(function* () {
       const controller = yield* HVACController;
 
-      yield* controller.start;
+      yield* controller.start();
 
       // Test heating override
       const heatingResult = yield* controller.manualOverride('heat', { temperature: 22.0 });
@@ -296,7 +297,7 @@ Deno.test('Effect-TS HVAC Integration Tests', async (t) => {
       assertEquals(offResult.success, true);
       assertEquals(offResult.data?.action, 'off');
 
-      yield* controller.stop;
+      yield* controller.stop();
       return { heatingResult, coolingResult, offResult };
     });
 
@@ -313,19 +314,19 @@ Deno.test('Effect-TS HVAC Integration Tests', async (t) => {
     const effect = Effect.gen(function* () {
       const controller = yield* HVACController;
 
-      yield* controller.start;
+      yield* controller.start();
 
       // Test manual evaluation
-      const evalResult = yield* controller.triggerEvaluation;
+      const evalResult = yield* controller.triggerEvaluation();
       assertEquals(evalResult.success, true);
       assertExists(evalResult.timestamp);
 
       // Test efficiency evaluation
-      const efficiencyResult = yield* controller.evaluateEfficiency;
+      const efficiencyResult = yield* controller.evaluateEfficiency();
       assertEquals(efficiencyResult.success, true);
       assertExists(efficiencyResult.data);
 
-      yield* controller.stop;
+      yield* controller.stop();
       return { evalResult, efficiencyResult };
     });
 
@@ -341,7 +342,7 @@ Deno.test('Effect-TS HVAC Integration Tests', async (t) => {
     const effect = Effect.gen(function* () {
       const haClient = yield* HomeAssistantClient;
 
-      yield* haClient.connect;
+      yield* haClient.connect();
 
       const indoorState = yield* haClient.getState('sensor.indoor_temperature');
       const outdoorState = yield* haClient.getState('sensor.outdoor_temperature');
@@ -354,10 +355,10 @@ Deno.test('Effect-TS HVAC Integration Tests', async (t) => {
       assertEquals(outdoorState.state, '15.0');
       assertEquals(outdoorState.getNumericState(), 15.0);
 
-      const stats = yield* haClient.getStats;
+      const stats = yield* haClient.getStats();
       assertEquals(stats.totalConnections, 1);
 
-      yield* haClient.disconnect;
+      yield* haClient.disconnect();
       return { indoorState, outdoorState, stats };
     });
 
@@ -374,20 +375,20 @@ Deno.test('Effect-TS HVAC Integration Tests', async (t) => {
     const effect = Effect.gen(function* () {
       const stateMachine = yield* HVACStateMachine;
 
-      yield* stateMachine.start;
+      yield* stateMachine.start();
 
-      const status = yield* stateMachine.getStatus;
+      const status = yield* stateMachine.getStatus();
       assertEquals(status.currentState, 'idle');
       assertEquals(status.context.indoorTemp, 22.5);
       assertEquals(status.context.outdoorTemp, 15.0);
 
       // Test state machine operations
       yield* stateMachine.updateTemperatures(18.0, 5.0);
-      yield* stateMachine.evaluateConditions;
+      yield* stateMachine.evaluateConditions();
       yield* stateMachine.manualOverride(HVACMode.HEAT, 22.0);
-      yield* stateMachine.clearOverride;
+      yield* stateMachine.clearOverride();
 
-      yield* stateMachine.stop;
+      yield* stateMachine.stop();
       return status;
     });
 
@@ -403,7 +404,7 @@ Deno.test('Effect-TS HVAC Integration Tests', async (t) => {
     const effect = Effect.gen(function* () {
       const haClient = yield* HomeAssistantClient;
 
-      yield* haClient.connect;
+      yield* haClient.connect();
 
       // Try to get a non-existent entity
       const result = yield* Effect.either(
@@ -417,7 +418,7 @@ Deno.test('Effect-TS HVAC Integration Tests', async (t) => {
         throw new Error('Expected StateError for non-existent entity');
       }
 
-      yield* haClient.disconnect;
+      yield* haClient.disconnect();
       return result;
     });
 
@@ -465,24 +466,24 @@ Deno.test('Effect-TS HVAC Integration Tests', async (t) => {
 
       // Demonstrate Effect retry on connection
       const connectionResult = yield* Effect.retry(
-        haClient.connect,
+        haClient.connect(),
         { times: 3 }
       );
 
       // Demonstrate Effect fallback on controller start
       const startResult = yield* Effect.catchAll(
-        controller.start,
+        controller.start(),
         (error) => Effect.succeed(`Fallback: ${error._tag}`)
       );
 
       // Demonstrate Effect timeout
       const statusResult = yield* Effect.timeout(
-        controller.getStatus,
+        controller.getStatus(),
         '5 seconds'
       );
 
-      yield* controller.stop;
-      yield* haClient.disconnect;
+      yield* controller.stop();
+      yield* haClient.disconnect();
 
       return { connectionResult, startResult, statusResult };
     });
@@ -504,23 +505,23 @@ Deno.test('Effect-TS HVAC Integration Tests', async (t) => {
 
       // Start all services concurrently
       yield* Effect.all([
-        haClient.connect,
-        stateMachine.start,
-        controller.start,
+        haClient.connect(),
+        stateMachine.start(),
+        controller.start(),
       ], { concurrency: 'unbounded' });
 
       // Get multiple status reports concurrently
       const results = yield* Effect.all([
-        controller.getStatus,
-        haClient.getStats,
-        stateMachine.getStatus,
+        controller.getStatus(),
+        haClient.getStats(),
+        stateMachine.getStatus(),
       ], { concurrency: 'unbounded' });
 
       // Stop all services concurrently
       yield* Effect.all([
-        controller.stop,
-        stateMachine.stop,
-        haClient.disconnect,
+        controller.stop(),
+        stateMachine.stop(),
+        haClient.disconnect(),
       ], { concurrency: 'unbounded' });
 
       return results;

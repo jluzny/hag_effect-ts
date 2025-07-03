@@ -1,5 +1,7 @@
 # HAG Effect-TS Variant
 
+This is an experimental alpha version migrating from Rust-based Hass HVAC automation to Effect-TS to evaluate the latest tools and frameworks in the ecosystem.
+
 Home Assistant aGentic HVAC automation system - Modern functional TypeScript implementation with Effect-TS ecosystem.
 
 ## Overview

@@ -4,9 +4,11 @@
  * Effect-native implementation with proper error handling and resource management.
  */
 
-import { Effect, Context, Layer, pipe, Schedule, Duration, Ref } from 'effect';
-import { HttpClient } from '@effect/platform/Http';
-import { HassOptions } from '../config/settings.ts';
+import { Effect, Context, Layer, pipe, Schedule, Duration, Ref, Fiber } from 'effect';
+import { HttpClient } from '@effect/platform';
+import { NodeHttpClient } from '@effect/platform-node';
+import { HassOptions } from '../config/settings_simple.ts';
+import { HassOptionsService } from '../core/container.ts';
 import { ConnectionError, StateError, ErrorUtils } from '../core/exceptions.ts';
 import { 
   HassStateImpl, 
@@ -26,13 +28,13 @@ export class HomeAssistantClient extends Context.Tag('HomeAssistantClient')<
   {
     readonly connect: () => Effect.Effect<void, ConnectionError>;
     readonly disconnect: () => Effect.Effect<void, never>;
-    readonly connected: Effect.Effect<boolean, never>;
+    readonly connected: () => Effect.Effect<boolean, never>;
     readonly getStats: () => Effect.Effect<ConnectionStats, never>;
-    readonly getState: (entityId: string) => Effect.Effect<HassStateImpl, StateError>;
+    readonly getState: (entityId: string) => Effect.Effect<HassStateImpl, StateError, HttpClient.HttpClient>;
     readonly callService: (serviceCall: HassServiceCallImpl) => Effect.Effect<void, ConnectionError>;
     readonly subscribeEvents: (eventType: string) => Effect.Effect<void, ConnectionError>;
-    readonly addEventHandler: (eventType: string, handler: (event: HassEventImpl) => Effect.Effect<void, never>) => Effect.Effect<void, never>;
-    readonly removeEventHandler: (eventType: string, handler: (event: HassEventImpl) => Effect.Effect<void, never>) => Effect.Effect<void, never>;
+    readonly addEventHandler: (eventType: string, handler: (event: HassEventImpl) => Effect.Effect<void, never, HttpClient.HttpClient>) => Effect.Effect<void, never>;
+    readonly removeEventHandler: (eventType: string, handler: (event: HassEventImpl) => Effect.Effect<void, never, HttpClient.HttpClient>) => Effect.Effect<void, never>;
   }
 >() {}
 
@@ -40,14 +42,14 @@ export class HomeAssistantClient extends Context.Tag('HomeAssistantClient')<
  * Internal state for the Home Assistant client
  */
 interface ClientState {
-  ws?: WebSocket;
-  messageId: number;
-  connectionState: WebSocketState;
-  eventHandlers: Map<string, Set<(event: HassEventImpl) => Effect.Effect<void, never>>>;
-  subscriptions: Set<string>;
-  stats: ConnectionStats;
-  reconnectFiber?: Effect.Fiber.Fiber<void, never>;
-  pingFiber?: Effect.Fiber.Fiber<void, never>;
+  readonly ws: WebSocket | undefined;
+  readonly messageId: number;
+  readonly connectionState: WebSocketState;
+  readonly eventHandlers: Map<string, Set<(event: HassEventImpl) => Effect.Effect<void, never, HttpClient.HttpClient>>>;
+  readonly subscriptions: Set<string>;
+  readonly stats: ConnectionStats;
+  readonly reconnectFiber?: Fiber.Fiber<void, never>;
+  readonly pingFiber?: Fiber.RuntimeFiber<unknown, never>;
 }
 
 /**
@@ -56,7 +58,7 @@ interface ClientState {
 class HomeAssistantClientImpl {
   constructor(
     private config: HassOptions,
-    private stateRef: Ref.Ref<ClientState>,
+    private readonly stateRef: Ref.Ref<ClientState>,
   ) {}
 
   /**
@@ -126,8 +128,8 @@ class HomeAssistantClientImpl {
           Ref.update((state) => ({
             ...state,
             ws: undefined,
-            eventHandlers: new Map(),
-            subscriptions: new Set(),
+            eventHandlers: new Map<string, Set<(event: HassEventImpl) => Effect.Effect<void, never, HttpClient.HttpClient>>>(),
+            subscriptions: new Set<string>(),
           }))
         )
       ),
@@ -137,7 +139,7 @@ class HomeAssistantClientImpl {
   /**
    * Check if connected
    */
-  connected: Effect.Effect<boolean, never> = pipe(
+  connected = (): Effect.Effect<boolean, never> => pipe(
     this.stateRef,
     Ref.get,
     Effect.map((state) => 
@@ -158,9 +160,9 @@ class HomeAssistantClientImpl {
   /**
    * Get entity state via REST API
    */
-  getState = (entityId: string): Effect.Effect<HassStateImpl, StateError> =>
+  getState = (entityId: string): Effect.Effect<HassStateImpl, StateError, HttpClient.HttpClient> =>
     pipe(
-      this.connected,
+      this.connected(),
       Effect.flatMap((isConnected) => {
         if (!isConnected) {
           return Effect.fail(ErrorUtils.stateError('Not connected to Home Assistant', entityId));
@@ -176,23 +178,27 @@ class HomeAssistantClientImpl {
               },
             })
           ),
+          Effect.mapError((error) => ErrorUtils.stateError(`HTTP request failed: ${error}`, entityId)),
           Effect.flatMap((response) => {
             if (response.status === 404) {
               return Effect.fail(ErrorUtils.stateError(`Entity not found: ${entityId}`, entityId));
             }
-            if (!response.ok) {
+            if (response.status >= 400) {
               return Effect.fail(
                 ErrorUtils.stateError(
-                  `HTTP ${response.status}: ${response.statusText}`, 
+                  `HTTP ${response.status}: ${response.status}`, 
                   entityId
                 )
               );
             }
-            return Effect.promise(() => response.json());
+            return Effect.tryPromise({
+              try: async () => await response.json,
+              catch: (error) => ErrorUtils.stateError(`Failed to parse JSON: ${error}`, entityId)
+            });
           }),
           Effect.flatMap((data) =>
             Effect.try({
-              try: () => HassStateImpl.fromApiResponse(data),
+              try: () => HassStateImpl.fromApiResponse(data as unknown as Record<string, unknown>),
               catch: (error) => ErrorUtils.stateError(
                 `Failed to parse state data: ${error}`,
                 entityId
@@ -216,7 +222,7 @@ class HomeAssistantClientImpl {
    */
   callService = (serviceCall: HassServiceCallImpl): Effect.Effect<void, ConnectionError> =>
     pipe(
-      this.connected,
+      this.connected(),
       Effect.flatMap((isConnected) => {
         if (!isConnected) {
           return Effect.fail(ErrorUtils.connectionError('Not connected to Home Assistant'));
@@ -250,7 +256,7 @@ class HomeAssistantClientImpl {
    */
   subscribeEvents = (eventType: string): Effect.Effect<void, ConnectionError> =>
     pipe(
-      this.connected,
+      this.connected(),
       Effect.flatMap((isConnected) => {
         if (!isConnected) {
           return Effect.fail(ErrorUtils.connectionError('Not connected to Home Assistant'));
@@ -298,7 +304,7 @@ class HomeAssistantClientImpl {
    */
   addEventHandler = (
     eventType: string, 
-    handler: (event: HassEventImpl) => Effect.Effect<void, never>
+    handler: (event: HassEventImpl) => Effect.Effect<void, never, HttpClient.HttpClient>
   ): Effect.Effect<void, never> =>
     pipe(
       this.stateRef,
@@ -316,7 +322,7 @@ class HomeAssistantClientImpl {
    */
   removeEventHandler = (
     eventType: string,
-    handler: (event: HassEventImpl) => Effect.Effect<void, never>
+    handler: (event: HassEventImpl) => Effect.Effect<void, never, HttpClient.HttpClient>
   ): Effect.Effect<void, never> =>
     pipe(
       this.stateRef,
@@ -345,12 +351,12 @@ class HomeAssistantClientImpl {
       ),
       Effect.andThen(
         Effect.tryPromise({
-          try: async () => {
+          try: () => {
             const ws = new WebSocket(this.config.wsUrl);
             
-            return new Promise<WebSocket>((resolve, reject) => {
+            return new Promise<WebSocket>((resolve, _reject) => {
               ws.onopen = () => resolve(ws);
-              ws.onerror = (error) => reject(error);
+              ws.onerror = (error) => _reject(error);
               ws.onmessage = (event) => {
                 this.handleMessage(JSON.parse(event.data));
               };
@@ -390,7 +396,7 @@ class HomeAssistantClientImpl {
             await this.sendMessageSync(authMessage);
             
             // Wait for auth response - simplified for this implementation
-            await new Promise((resolve, reject) => {
+            await new Promise((resolve, _reject) => {
               setTimeout(() => resolve(undefined), 1000); // Simple delay
             });
           },
@@ -421,7 +427,7 @@ class HomeAssistantClientImpl {
       Effect.flatMap((pingFiber) =>
         pipe(
           this.stateRef,
-          Ref.update((state) => ({ ...state, pingFiber }))
+          Ref.update((state) => ({ ...state, pingFiber: pingFiber }))
         )
       ),
       Effect.asVoid
@@ -436,7 +442,7 @@ class HomeAssistantClientImpl {
       Ref.get,
       Effect.flatMap((state) => {
         if (state.pingFiber) {
-          return Effect.fork(state.pingFiber.interrupt());
+          return Effect.fork(Fiber.interrupt(state.pingFiber!));
         }
         return Effect.void;
       }),
@@ -448,7 +454,7 @@ class HomeAssistantClientImpl {
    */
   private sendPing = (): Effect.Effect<void, never> =>
     pipe(
-      this.connected,
+      this.connected(),
       Effect.flatMap((isConnected) => {
         if (isConnected) {
           return pipe(
@@ -536,6 +542,7 @@ class HomeAssistantClientImpl {
               const effects = Array.from(handlers).map((handler) =>
                 pipe(
                   handler(event),
+                  Effect.provide(NodeHttpClient.layer),
                   Effect.catchAll((error) =>
                     Effect.logError('Event handler failed', { error })
                   )
@@ -664,9 +671,10 @@ class HomeAssistantClientImpl {
 export const HomeAssistantClientLive = Layer.effect(
   HomeAssistantClient,
   Effect.gen(function* () {
-    const config = yield* Context.Tag<HassOptions>('HassOptions');
+    const config = yield* HassOptionsService;
     
     const initialState: ClientState = {
+      ws: undefined,
       messageId: 1,
       connectionState: WebSocketState.DISCONNECTED,
       eventHandlers: new Map(),

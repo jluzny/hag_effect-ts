@@ -1,35 +1,10 @@
-/**
- * HVAC state machine implementation for HAG Effect-TS variant.
- * 
- * XState-powered state machine with Effect-native error handling and immutable patterns.
- */
 
-import { Effect, pipe, Context, Layer } from 'effect';
 import { createMachine, assign, interpret, ActorRefFrom } from 'xstate';
 import { HvacOptions } from '../config/settings_simple.ts';
-import { HvacOptionsService } from '../core/container.ts';
 import { HVACContext, StateChangeData, SystemMode, HVACMode } from '../types/common.ts';
 import { StateError, ErrorUtils } from '../core/exceptions.ts';
-
-/**
- * HVAC events that can trigger state transitions
- */
-export type HVACEvent =
-  | { type: 'HEAT' }
-  | { type: 'COOL' }
-  | { type: 'OFF' }
-  | { type: 'AUTO_EVALUATE' }
-  | { type: 'DEFROST_NEEDED' }
-  | { type: 'DEFROST_COMPLETE' }
-  | { type: 'UPDATE_CONDITIONS'; data: Partial<HVACContext> }
-  | { type: 'UPDATE_TEMPERATURES'; indoor: number; outdoor: number }
-  | { type: 'MANUAL_OVERRIDE'; mode: HVACMode; temperature?: number };
-
-/**
- * State machine type definitions
- */
-export type HVACMachine = ReturnType<typeof createHVACMachine>;
-export type HVACMachineActor = ActorRefFrom<HVACMachine>;
+import { Effect, pipe, Context } from 'effect';
+import { LoggerService } from '../core/container.ts';
 
 /**
  * HVAC strategies using Effect patterns
@@ -248,11 +223,12 @@ export class CoolingStrategy {
     const start = isWeekday ? activeHours.startWeekday : activeHours.start;
     return hour >= start && hour <= activeHours.end;
   }
+}
 
 /**
  * Create HVAC state machine with XState and Effect integration
  */
-const createHVACMachine = (hvacOptions: HvacOptions, logger: Context.Tag.Service<LoggerService>) => {
+export const createHVACMachine = (hvacOptions: HvacOptions, logger: Context.Tag.Service<LoggerService>) => {
   const heatingStrategy = new HeatingStrategy(hvacOptions, logger);
   const coolingStrategy = new CoolingStrategy(hvacOptions, logger);
 
@@ -402,27 +378,47 @@ const createHVACMachine = (hvacOptions: HvacOptions, logger: Context.Tag.Service
   }, {
     actions: {
       logStateEntry: ({ context }, event) => {
-        // Effect logging will be handled in the service layer
-        console.log(`[HVAC] Entering state: ${(event as { type?: string })?.type ?? 'unknown'}`, {
+        const eventType = (event as unknown as { type?: string })?.type;
+        let message = '🔄 [HVAC] State transition';
+        if (eventType) {
+          message += ` triggered by: ${eventType}`;
+        }
+        Effect.runFork(logger.info(message, {
+          toState: event.type,
+          event, // Log the entire event object for debugging
           indoorTemp: context.indoorTemp,
           outdoorTemp: context.outdoorTemp,
           systemMode: context.systemMode,
-        });
+          currentHour: context.currentHour,
+          isWeekday: context.isWeekday,
+          timestamp: new Date().toISOString()
+        }));
       },
       logHeatingStart: ({ context }) => {
-        console.log(`[HVAC] Starting heating`, {
+        Effect.runFork(logger.info(`🔥 [HVAC] Starting heating mode`, {
           targetTemp: hvacOptions.heating.temperature,
           indoorTemp: context.indoorTemp,
-        });
+          outdoorTemp: context.outdoorTemp,
+          presetMode: hvacOptions.heating.presetMode,
+          thresholds: hvacOptions.heating.temperatureThresholds,
+          timestamp: new Date().toISOString()
+        }));
       },
       logCoolingStart: ({ context }) => {
-        console.log(`[HVAC] Starting cooling`, {
+        Effect.runFork(logger.info(`❄️ [HVAC] Starting cooling mode`, {
           targetTemp: hvacOptions.cooling.temperature,
           indoorTemp: context.indoorTemp,
-        });
+          outdoorTemp: context.outdoorTemp,
+          presetMode: hvacOptions.cooling.presetMode,
+          thresholds: hvacOptions.cooling.temperatureThresholds,
+          timestamp: new Date().toISOString()
+        }));
       },
       logManualOverride: (_, event) => {
-        console.log(`[HVAC] Manual override activated`, (event as { type?: string })?.type ?? 'unknown');
+        Effect.runFork(logger.info(`🎯 [HVAC] Manual override activated`, {
+          event,
+          timestamp: new Date().toISOString()
+        }));
       },
       updateConditions: assign(({ context, event }) => {
         if (event.type !== 'UPDATE_CONDITIONS') return context;
@@ -439,11 +435,17 @@ const createHVACMachine = (hvacOptions: HvacOptions, logger: Context.Tag.Service
         };
       }),
       startDefrost: () => {
-        // Effect will be handled in the service layer
-        heatingStrategy.startDefrost();
+        Effect.runFork(heatingStrategy.startDefrost());
+        Effect.runFork(logger.info(`❄️ [HVAC] Defrost cycle started`, {
+          durationSeconds: hvacOptions.heating.defrost?.durationSeconds || 300,
+          timestamp: new Date().toISOString()
+        }));
       },
       completeDefrost: () => {
-        console.log(`[HVAC] Defrost cycle completed`);
+        Effect.runFork(logger.info(`✅ [HVAC] Defrost cycle completed`, {
+          timestamp: new Date().toISOString(),
+          nextState: 'heating'
+        }));
       },
     },
     guards: {
@@ -533,235 +535,4 @@ const createHVACMachine = (hvacOptions: HvacOptions, logger: Context.Tag.Service
       },
     },
   });
-}
-
-/**
- * HVAC state machine service using Effect Context pattern
- */
-export class HVACStateMachine extends Context.Tag('HVACStateMachine')<
-  HVACStateMachine,
-  {
-    readonly start: () => Effect.Effect<void, StateError>;
-    readonly stop: () => Effect.Effect<void, never>;
-    readonly send: (event: HVACEvent) => Effect.Effect<void, StateError>;
-    readonly getCurrentState: () => Effect.Effect<string, never>;
-    readonly getContext: () => Effect.Effect<HVACContext, StateError>;
-    readonly updateTemperatures: (indoor: number, outdoor: number) => Effect.Effect<void, StateError>;
-    readonly evaluateConditions: () => Effect.Effect<void, StateError>;
-    readonly manualOverride: (mode: HVACMode, temperature?: number) => Effect.Effect<void, StateError>;
-    readonly getStatus: () => Effect.Effect<{
-      readonly currentState: string;
-      readonly context: HVACContext;
-      readonly canHeat: boolean;
-      readonly canCool: boolean;
-      readonly systemMode: SystemMode;
-    }, StateError>;
-  }
->() {}
-
-/**
- * Implementation of the HVAC state machine service
- */
-class HVACStateMachineImpl {
-  private machine: HVACMachine;
-  private actor?: HVACMachineActor;
-
-  constructor(private hvacOptions: HvacOptions, private logger: Context.Tag.Service<LoggerService>) {
-    this.machine = createHVACMachine(hvacOptions, logger);
-  }
-
-  start = (): Effect.Effect<void, StateError> =>
-    Effect.gen((function* (this: HVACStateMachineImpl) {
-      yield* Effect.logInfo('🚀 Starting HVAC state machine', {
-        machineId: this.machine.id,
-        initialState: 'idle',
-        alreadyRunning: !!this.actor
-      });
-
-      if (this.actor) {
-        yield* Effect.fail(ErrorUtils.stateError('State machine is already running'));
-      }
-
-      this.actor = interpret(this.machine);
-      
-      // Add state transition logging
-      this.actor.subscribe((snapshot) => {
-        Effect.runFork(Effect.logInfo('🔄 State machine transition', {
-          toState: snapshot.value,
-          context: snapshot.context,
-          status: snapshot.status,
-          timestamp: new Date().toISOString()
-        }));
-      });
-      
-      this.actor.start();
-      
-      const initialSnapshot = this.actor.getSnapshot();
-      
-      yield* Effect.logInfo('✅ HVAC state machine started', {
-        initialState: initialSnapshot.value,
-        initialContext: initialSnapshot.context,
-        machineStatus: initialSnapshot.status,
-        timestamp: new Date().toISOString()
-      });
-    }).bind(this));
-
-  stop = (): Effect.Effect<void, never> =>
-    Effect.gen((function* (this: HVACStateMachineImpl) {
-      yield* Effect.logInfo('🛑 Stopping HVAC state machine', {
-        currentState: this.actor?.getSnapshot().value || 'not_running',
-        isRunning: !!this.actor
-      });
-
-      if (this.actor) {
-        const finalSnapshot = this.actor.getSnapshot();
-        
-        yield* Effect.logDebug('📋 Final state machine status', {
-          finalState: finalSnapshot.value,
-          finalContext: finalSnapshot.context,
-          machineStatus: finalSnapshot.status
-        });
-        
-        this.actor.stop();
-        this.actor = undefined;
-        
-        yield* Effect.logInfo('✅ HVAC state machine stopped');
-      } else {
-        yield* Effect.logDebug('🔄 State machine was not running');
-      }
-    }).bind(this));
-
-  send = (event: HVACEvent): Effect.Effect<void, StateError> =>
-    Effect.gen((function* (this: HVACStateMachineImpl) {
-      if (!this.actor) {
-        yield* Effect.fail(ErrorUtils.stateError('State machine is not running'));
-      }
-      
-      const beforeSnapshot = this.actor.getSnapshot();
-      
-      yield* Effect.logDebug('📤 Sending event to state machine', {
-        event,
-        eventType: event.type,
-        currentState: beforeSnapshot.value,
-        context: beforeSnapshot.context,
-      });
-      
-      this.actor!.send(event);
-      
-      const afterSnapshot = this.actor.getSnapshot();
-      
-      if (beforeSnapshot.value !== afterSnapshot.value) {
-        yield* Effect.logInfo('⚙️ Event triggered state transition', {
-          event,
-          fromState: beforeSnapshot.value,
-          toState: afterSnapshot.value,
-          contextChanged: JSON.stringify(beforeSnapshot.context) !== JSON.stringify(afterSnapshot.context)
-        });
-      } else {
-        yield* Effect.logDebug('🔄 Event processed without state change', {
-          event,
-          currentState: afterSnapshot.value,
-          contextChanged: JSON.stringify(beforeSnapshot.context) !== JSON.stringify(afterSnapshot.context)
-        });
-      }
-    }).bind(this));
-
-  getCurrentState = (): Effect.Effect<string, never> =>
-    Effect.sync(() => {
-      if (!this.actor) {
-        return 'stopped';
-      }
-      return this.actor.getSnapshot().value as string;
-    });
-
-  getContext = (): Effect.Effect<HVACContext, StateError> =>
-    Effect.gen((function* (this: HVACStateMachineImpl) {
-      if (!this.actor) {
-        yield* Effect.fail(ErrorUtils.stateError('State machine is not running'));
-      }
-      
-      return this.actor!.getSnapshot().context;
-    }).bind(this));
-
-  updateTemperatures = (indoor: number, outdoor: number): Effect.Effect<void, StateError> =>
-    pipe(
-      this.getContext(),
-      Effect.flatMap((context) => {
-        const tempChange = {
-          indoorChange: context.indoorTemp ? indoor - context.indoorTemp : undefined,
-          outdoorChange: context.outdoorTemp ? outdoor - context.outdoorTemp : undefined
-        };
-        
-        return pipe(
-          Effect.logInfo('🌡️ Updating temperature conditions', {
-            indoor,
-            outdoor,
-            previousIndoor: context.indoorTemp,
-            previousOutdoor: context.outdoorTemp,
-            indoorChange: tempChange.indoorChange,
-            outdoorChange: tempChange.outdoorChange,
-            significantChange: Math.abs(tempChange.indoorChange || 0) > 0.5 || Math.abs(tempChange.outdoorChange || 0) > 2,
-          }),
-          Effect.andThen(this.send({
-            type: 'UPDATE_TEMPERATURES',
-            indoor,
-            outdoor,
-          }))
-        );
-      })
-    );
-
-  evaluateConditions = (): Effect.Effect<void, StateError> =>
-    this.send({ type: 'AUTO_EVALUATE' });
-
-  manualOverride = (mode: HVACMode, temperature?: number): Effect.Effect<void, StateError> =>
-    this.send({
-      type: 'MANUAL_OVERRIDE',
-      mode,
-      temperature,
-    });
-
-  getStatus = (): Effect.Effect<{
-    readonly currentState: string;
-    readonly context: HVACContext;
-    readonly canHeat: boolean;
-    readonly canCool: boolean;
-    readonly systemMode: SystemMode;
-  }, StateError> =>
-    Effect.gen((function* (this: HVACStateMachineImpl) {
-      const currentState = yield* this.getCurrentState();
-      const context = yield* this.getContext();
-      
-      return {
-        currentState,
-        context,
-        canHeat: context.systemMode !== SystemMode.COOL_ONLY && context.systemMode !== SystemMode.OFF,
-        canCool: context.systemMode !== SystemMode.HEAT_ONLY && context.systemMode !== SystemMode.OFF,
-        systemMode: context.systemMode,
-      } as const;
-    }).bind(this));
-}
-
-/**
- * Layer for providing HVAC state machine service
- */
-export const HVACStateMachineLive = Layer.effect(
-  HVACStateMachine,
-  Effect.gen(function* () {
-    // Get HVAC options from config - this would be injected
-    const hvacOptions = yield* HvacOptionsService;
-    const impl = new HVACStateMachineImpl(hvacOptions);
-    
-    return HVACStateMachine.of({
-      start: impl.start,
-      stop: impl.stop,
-      send: impl.send,
-      getCurrentState: impl.getCurrentState,
-      getContext: impl.getContext,
-      updateTemperatures: impl.updateTemperatures,
-      evaluateConditions: impl.evaluateConditions,
-      manualOverride: impl.manualOverride,
-      getStatus: impl.getStatus,
-    });
-  })
-);
+};

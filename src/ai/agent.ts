@@ -1,21 +1,30 @@
 /**
  * AI Agent for HAG Effect-TS variant.
- * 
+ *
  * Effect-native LangChain integration for intelligent HVAC decision making.
  */
 
-import { Effect, Context, Layer, pipe, Ref } from 'effect';
+import { Context, Effect, Layer, pipe, Ref } from 'effect';
+import { NodeHttpClient } from '@effect/platform-node';
 import { ChatOpenAI } from '@langchain/openai';
-import { HumanMessage, SystemMessage, AIMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  HumanMessage,
+  SystemMessage,
+} from '@langchain/core/messages';
 import { Tool } from '@langchain/core/tools';
 import { AgentExecutor, createToolCallingAgent } from 'langchain/agents';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
-import { HvacOptions, ApplicationOptions } from '../config/settings.ts';
+import { ApplicationOptions, HvacOptions } from '../config/settings_simple.ts';
 import { HVACStateMachine } from '../hvac/state-machine.ts';
 import { HomeAssistantClient } from '../home-assistant/client.ts';
 import { HVACMode, OperationResult } from '../types/common.ts';
-import { AIError, StateError, ErrorUtils } from '../core/exceptions.ts';
-import { LoggerService } from '../core/container.ts';
+import { AIError, ErrorUtils } from '../core/exceptions.ts';
+import {
+  ApplicationOptionsService,
+  HvacOptionsService,
+  LoggerService,
+} from '../core/container.ts';
 
 /**
  * HVAC status summary interface
@@ -54,8 +63,13 @@ interface AgentState {
 export class HVACAgent extends Context.Tag('HVACAgent')<
   HVACAgent,
   {
-    readonly processTemperatureChange: (event: TemperatureChangeEvent) => Effect.Effect<OperationResult, AIError>;
-    readonly manualOverride: (action: string, options?: Record<string, unknown>) => Effect.Effect<OperationResult, AIError>;
+    readonly processTemperatureChange: (
+      event: TemperatureChangeEvent,
+    ) => Effect.Effect<OperationResult, AIError>;
+    readonly manualOverride: (
+      action: string,
+      options?: Record<string, unknown>,
+    ) => Effect.Effect<OperationResult, AIError>;
     readonly evaluateEfficiency: () => Effect.Effect<OperationResult, AIError>;
     readonly getStatusSummary: () => Effect.Effect<HVACStatusSummary, never>;
     readonly clearHistory: () => Effect.Effect<void, never>;
@@ -68,65 +82,131 @@ export class HVACAgent extends Context.Tag('HVACAgent')<
  */
 class EffectHVACControlTool extends Tool {
   name = 'hvac_control';
-  description = 'Control HVAC system (heat, cool, off) with optional target temperature';
+  description =
+    'Control HVAC system (heat, cool, off) with optional target temperature';
 
   constructor(
-    private stateMachine: HVACStateMachine,
-    private logger: LoggerService,
+    private stateMachine: Context.Tag.Service<HVACStateMachine>,
+    private logger: Context.Tag.Service<LoggerService>,
   ) {
     super();
   }
 
   async _call(input: string): Promise<string> {
-    try {
-      const { action, temperature } = JSON.parse(input);
-      
-      // Parse HVAC mode
-      let mode: HVACMode;
-      switch (action.toLowerCase()) {
-        case 'heat':
-          mode = HVACMode.HEAT;
-          break;
-        case 'cool':
-          mode = HVACMode.COOL;
-          break;
-        case 'off':
-          mode = HVACMode.OFF;
-          break;
-        default:
-          return `Error: Invalid action '${action}'. Use 'heat', 'cool', or 'off'.`;
-      }
+    const executionStart = Date.now();
+    return Effect.runPromise(
+      pipe(
+        Effect.tryPromise({
+          try: async () => {
+            await Effect.runPromise(
+              this.logger.info('🤖 AI executing HVAC control tool', {
+                input,
+                timestamp: new Date().toISOString(),
+              }),
+            );
+            const { action, temperature } = JSON.parse(input);
 
-      // Execute through Effect - simplified for tool context
-      const result = await Effect.runPromise(
-        pipe(
-          this.executeManualOverride(mode, temperature),
-          Effect.andThen(() =>
-            this.logger.debug('AI agent executed HVAC control', { action, temperature })
-          ),
-          Effect.catchAll((error) =>
-            pipe(
-              this.logger.error('AI HVAC control failed', error),
-              Effect.andThen(Effect.fail(error))
-            )
-          )
-        )
-      );
-      
-      return `Successfully set HVAC to ${action}${temperature ? ` at ${temperature}°C` : ''}`;
-      
-    } catch (error) {
-      const errorMsg = `Failed to control HVAC: ${error instanceof Error ? error.message : String(error)}`;
-      return errorMsg;
-    }
+            await Effect.runPromise(
+              this.logger.debug('📝 AI parsed HVAC control parameters', {
+                action,
+                temperature,
+                hasTemperature: temperature !== undefined,
+              }),
+            );
+
+            let mode: HVACMode;
+            switch (action.toLowerCase()) {
+              case 'heat':
+                mode = HVACMode.HEAT;
+                break;
+              case 'cool':
+                mode = HVACMode.COOL;
+                break;
+              case 'off':
+                mode = HVACMode.OFF;
+                break;
+              default:
+                await Effect.runPromise(
+                  this.logger.warning('⚠️ AI provided invalid HVAC action', {
+                    action,
+                    validActions: ['heat', 'cool', 'off'],
+                  }),
+                );
+                return `Error: Invalid action '${action}'. Use 'heat', 'cool', or 'off'.`;
+            }
+
+            const status = await Effect.runPromise(this.stateMachine.getStatus());
+            const currentState = status.currentState;
+
+            await Effect.runPromise(
+              this.logger.info('⚡ AI executing HVAC mode change', {
+                requestedMode: mode,
+                requestedTemperature: temperature,
+                currentState,
+                currentContext: status.context,
+                decisionRationale: 'AI_agent_decision',
+              }),
+            );
+
+            await Effect.runPromise(
+              this.stateMachine.manualOverride(mode, temperature),
+            );
+
+            const newStatus = await Effect.runPromise(this.stateMachine.getStatus());
+            const newState = newStatus.currentState;
+            const executionTime = Date.now() - executionStart;
+
+            await Effect.runPromise(
+              this.logger.info('✅ AI HVAC control executed successfully', {
+                action,
+                mode,
+                temperature,
+                oldState: currentState,
+                newState,
+                stateChanged: currentState !== newState,
+                executionTimeMs: executionTime,
+              }),
+            );
+
+            return `Successfully set HVAC to ${action}${
+              temperature ? ` at ${temperature}°C` : ''
+            }. State changed from ${currentState} to ${newState}.`;
+          },
+          catch: (error) => {
+            const executionTime = Date.now() - executionStart;
+            const errorMsg = `Failed to control HVAC: ${
+              error instanceof Error ? error.message : String(error)
+            }`;
+            Effect.runSync(
+              this.logger.error('❌ AI HVAC control failed', error, {
+                input,
+                executionTimeMs: executionTime,
+                errorType: error instanceof Error ? error.name : 'Unknown',
+              }),
+            );
+            return errorMsg;
+          },
+        }),
+      ),
+    );
   }
 
-  private executeManualOverride = (mode: HVACMode, temperature?: number): Effect.Effect<void, never> =>
-    Effect.gen(function* () {
-      // Placeholder for state machine manual override
-      // In practice, this would call the actual state machine method
-      yield* Effect.void;
-    });
+  private executeManualOverride = (
+    mode: HVACMode,
+    temperature?: number,
+  ): Effect.Effect<void, AIError> =>
+    pipe(
+      this.stateMachine.manualOverride(mode, temperature),
+      Effect.mapError((stateError) =>
+        ErrorUtils.aiError(
+          `Manual override execution failed: ${
+            stateError instanceof Error
+              ? stateError.message
+              : String(stateError)
+          }`,
+        )
+      ),
+    );
 }
 
 /**
@@ -137,44 +217,115 @@ class EffectTemperatureReadingTool extends Tool {
   description = 'Get current indoor and outdoor temperature readings';
 
   constructor(
-    private haClient: HomeAssistantClient,
+    private haClient: Context.Tag.Service<HomeAssistantClient>,
     private hvacOptions: HvacOptions,
-    private logger: LoggerService,
+    private logger: Context.Tag.Service<LoggerService>,
   ) {
     super();
   }
 
   async _call(_input: string): Promise<string> {
-    try {
-      const result = await Effect.runPromise(
-        pipe(
-          Effect.all({
-            indoorState: this.haClient.getState(this.hvacOptions.tempSensor),
-            outdoorState: this.haClient.getState(this.hvacOptions.outdoorSensor)
-              .pipe(Effect.catchAll(() => Effect.succeed(null))),
-          }),
-          Effect.map(({ indoorState, outdoorState }) => {
-            const indoorTemp = indoorState.getNumericState();
-            const outdoorTemp = outdoorState?.getNumericState() ?? null;
+    const readingStart = Date.now();
+    return Effect.runPromise(
+      pipe(
+        Effect.tryPromise({
+          try: async () => {
+            await Effect.runPromise(
+              this.logger.info('🌡️ AI reading temperature data', {
+                indoorSensor: this.hvacOptions.tempSensor,
+                outdoorSensor: this.hvacOptions.outdoorSensor,
+                timestamp: new Date().toISOString(),
+              }),
+            );
 
-            return {
+            const indoorState = await Effect.runPromise(
+              pipe(
+                this.haClient.getState(this.hvacOptions.tempSensor),
+                Effect.provide(NodeHttpClient.layer),
+              ),
+            );
+            const indoorTemp = indoorState.getNumericState();
+
+            await Effect.runPromise(
+              this.logger.debug('✅ AI indoor temperature retrieved', {
+                sensor: this.hvacOptions.tempSensor,
+                temperature: indoorTemp,
+                state: indoorState.state,
+                lastUpdated: indoorState.lastUpdated,
+              }),
+            );
+
+            let outdoorTemp: number | null = null;
+            try {
+              const outdoorState = await Effect.runPromise(
+                pipe(
+                  this.haClient.getState(this.hvacOptions.outdoorSensor),
+                  Effect.provide(NodeHttpClient.layer),
+                ),
+              );
+              outdoorTemp = outdoorState.getNumericState();
+
+              await Effect.runPromise(
+                this.logger.debug('✅ AI outdoor temperature retrieved', {
+                  sensor: this.hvacOptions.outdoorSensor,
+                  temperature: outdoorTemp,
+                  state: outdoorState.state,
+                  lastUpdated: outdoorState.lastUpdated,
+                }),
+              );
+            } catch (error) {
+              await Effect.runPromise(
+                this.logger.warning(
+                  '⚠️ AI failed to get outdoor temperature',
+                  {
+                    error,
+                    sensor: this.hvacOptions.outdoorSensor,
+                    fallbackBehavior: 'continue_with_null',
+                  },
+                ),
+              );
+            }
+
+            const result = {
               indoor: indoorTemp,
               outdoor: outdoorTemp,
               timestamp: new Date().toISOString(),
             };
-          }),
-          Effect.tap((temperatures) =>
-            this.logger.debug('AI agent read temperatures', temperatures)
-          )
-        )
-      );
-      
-      return JSON.stringify(result);
 
-    } catch (error) {
-      const errorMsg = `Failed to read temperatures: ${error instanceof Error ? error.message : String(error)}`;
-      return errorMsg;
-    }
+            const readingTime = Date.now() - readingStart;
+
+            await Effect.runPromise(
+              this.logger.info('✅ AI temperature reading completed', {
+                ...result,
+                readingTimeMs: readingTime,
+                indoorValid: indoorTemp !== null,
+                outdoorValid: outdoorTemp !== null,
+                temperatureDifference: indoorTemp && outdoorTemp
+                  ? indoorTemp - outdoorTemp
+                  : null,
+              }),
+            );
+
+            return JSON.stringify(result);
+          },
+          catch: (error) => {
+            const readingTime = Date.now() - readingStart;
+            const errorMsg = `Failed to read temperatures: ${
+              error instanceof Error ? error.message : String(error)
+            }`;
+            Effect.runSync(
+              this.logger.error('❌ AI temperature reading failed', error, {
+                readingTimeMs: readingTime,
+                indoorSensor: this.hvacOptions.tempSensor,
+                outdoorSensor: this.hvacOptions.outdoorSensor,
+                errorType: error instanceof Error ? error.name : 'Unknown',
+              }),
+            );
+            return errorMsg;
+          },
+        }),
+      ),
+    );
   }
 }
 
@@ -186,38 +337,66 @@ class EffectHVACStatusTool extends Tool {
   description = 'Get current HVAC system status and state machine information';
 
   constructor(
-    private stateMachine: HVACStateMachine,
-    private logger: LoggerService,
+    private stateMachine: Context.Tag.Service<HVACStateMachine>,
+    private logger: Context.Tag.Service<LoggerService>,
   ) {
     super();
   }
 
   async _call(_input: string): Promise<string> {
-    try {
-      const result = await Effect.runPromise(
-        pipe(
-          this.getStateMachineStatus(),
-          Effect.map((status) => ({
-            currentState: status.currentState,
-            context: status.context,
-            timestamp: new Date().toISOString(),
-          })),
-          Effect.tap((status) =>
-            this.logger.debug('AI agent read HVAC status', status)
-          )
-        )
-      );
-      
-      return JSON.stringify(result);
+    const statusStart = Date.now();
+    return Effect.runPromise(
+      pipe(
+        Effect.tryPromise({
+          try: async () => {
+            await Effect.runPromise(
+              this.logger.info('📋 AI reading HVAC status', {
+                timestamp: new Date().toISOString(),
+              }),
+            );
 
-    } catch (error) {
-      const errorMsg = `Failed to get HVAC status: ${error instanceof Error ? error.message : String(error)}`;
-      return errorMsg;
-    }
+            const status = await Effect.runPromise(this.stateMachine.getStatus());
+
+            const result = {
+              currentState: status.currentState,
+              context: status.context,
+              canHeat: status.canHeat,
+              canCool: status.canCool,
+              systemMode: status.systemMode,
+              timestamp: new Date().toISOString(),
+            };
+
+            const statusTime = Date.now() - statusStart;
+
+            await Effect.runPromise(
+              this.logger.info('✅ AI HVAC status retrieved', {
+                ...result,
+                statusTimeMs: statusTime,
+                hasTemperatureData: !!(status.context.indoorTemp &&
+                  status.context.outdoorTemp),
+                isActive: status.currentState !== 'idle',
+              }),
+            );
+
+            return JSON.stringify(result);
+          },
+          catch: (error) => {
+            const statusTime = Date.now() - statusStart;
+            const errorMsg = `Failed to get HVAC status: ${
+              error instanceof Error ? error.message : String(error)
+            }`;
+            Effect.runSync(
+              this.logger.error('❌ AI status reading failed', error, {
+                statusTimeMs: statusTime,
+                errorType: error instanceof Error ? error.name : 'Unknown',
+              }),
+            );
+            return errorMsg;
+          },
+        }),
+      ),
+    );
   }
-
-  private getStateMachineStatus = (): Effect.Effect<any, never> =>
-    Effect.succeed({ currentState: 'idle', context: {} }); // Placeholder
 }
 
 /**
@@ -227,62 +406,57 @@ class HVACAgentImpl {
   constructor(
     private hvacOptions: HvacOptions,
     private appOptions: ApplicationOptions,
-    private stateMachine: HVACStateMachine,
-    private haClient: HomeAssistantClient,
-    private logger: LoggerService,
+    private stateMachine: Context.Tag.Service<HVACStateMachine>,
+    private haClient: Context.Tag.Service<HomeAssistantClient>,
+    private logger: Context.Tag.Service<LoggerService>,
     private stateRef: Ref.Ref<AgentState>,
   ) {}
 
   /**
    * Initialize the LangChain agent
    */
-  initializeAgent = (): Effect.Effect<void, AIError> =>
-    pipe(
-      Effect.gen(function* () {
-        // Initialize OpenAI LLM
+  initializeAgent = (): Effect.Effect<void, AIError> => {
+    const initStart = Date.now();
+    return pipe(
+      Effect.gen((function* (this: HVACAgentImpl) {
+        yield* this.logger.info('🤖 Initializing AI agent', {
+          model: 'gpt-4o-mini',
+          temperature: 0.1,
+          systemMode: this.hvacOptions.systemMode,
+          toolsCount: 3,
+          hasApiKey: !!this.appOptions.openaiApiKey,
+          logLevel: this.appOptions.logLevel,
+          timestamp: new Date().toISOString(),
+        });
+
         const llm = new ChatOpenAI({
           modelName: 'gpt-4o-mini',
           temperature: 0.1,
           openAIApiKey: this.appOptions.openaiApiKey,
         });
 
-        // Initialize tools
         const tools = [
           new EffectHVACControlTool(this.stateMachine, this.logger),
-          new EffectTemperatureReadingTool(this.haClient, this.hvacOptions, this.logger),
+          new EffectTemperatureReadingTool(
+            this.haClient,
+            this.hvacOptions,
+            this.logger,
+          ),
           new EffectHVACStatusTool(this.stateMachine, this.logger),
         ];
 
-        const systemPrompt = `You are an intelligent HVAC automation agent for a home automation system.
+        const systemPrompt =
+          `You are an intelligent HVAC automation agent for a home automation system.\n\nYour role is to:\n1. Monitor temperature changes and make intelligent heating/cooling decisions\n2. Analyze HVAC system efficiency and provide recommendations\n3. Handle manual override requests with validation\n4. Provide status summaries and insights\n\nCurrent HVAC Configuration:\n- System Mode: ${this.hvacOptions.systemMode}\n- Temperature Sensor: ${this.hvacOptions.tempSensor}\n- Outdoor Sensor: ${this.hvacOptions.outdoorSensor}\n- Heating Target: ${this.hvacOptions.heating.temperature}°C\n- Cooling Target: ${this.hvacOptions.cooling.temperature}°C\n- Heating Range: ${this.hvacOptions.heating.temperatureThresholds.indoorMin}°C - ${this.hvacOptions.heating.temperatureThresholds.indoorMax}°C\n- Cooling Range: ${this.hvacOptions.cooling.temperatureThresholds.indoorMin}°C - ${this.hvacOptions.cooling.temperatureThresholds.indoorMax}°C\n\nAvailable Tools:\n1. hvac_control - Control HVAC system (heat/cool/off)\n2. get_temperature - Read current temperatures\n3. get_hvac_status - Get system status\n\nAlways consider:\n- Energy efficiency\n- Comfort optimization\n- Outdoor weather conditions\n- Time of day and usage patterns\n- System constraints and thresholds\n\nRespond concisely and provide actionable insights.`;
 
-Your role is to:
-1. Monitor temperature changes and make intelligent heating/cooling decisions
-2. Analyze HVAC system efficiency and provide recommendations
-3. Handle manual override requests with validation
-4. Provide status summaries and insights
-
-Current HVAC Configuration:
-- System Mode: ${this.hvacOptions.systemMode}
-- Temperature Sensor: ${this.hvacOptions.tempSensor}
-- Outdoor Sensor: ${this.hvacOptions.outdoorSensor}
-- Heating Target: ${this.hvacOptions.heating.temperature}°C
-- Cooling Target: ${this.hvacOptions.cooling.temperature}°C
-- Heating Range: ${this.hvacOptions.heating.temperatureThresholds.indoorMin}°C - ${this.hvacOptions.heating.temperatureThresholds.indoorMax}°C
-- Cooling Range: ${this.hvacOptions.cooling.temperatureThresholds.indoorMin}°C - ${this.hvacOptions.cooling.temperatureThresholds.indoorMax}°C
-
-Available Tools:
-1. hvac_control - Control HVAC system (heat/cool/off)
-2. get_temperature - Read current temperatures
-3. get_hvac_status - Get system status
-
-Always consider:
-- Energy efficiency
-- Comfort optimization
-- Outdoor weather conditions
-- Time of day and usage patterns
-- System constraints and thresholds
-
-Respond concisely and provide actionable insights.`;
+        yield* this.logger.debug('📝 AI system prompt configured', {
+          promptLength: systemPrompt.length,
+          configurationIncluded: {
+            systemMode: true,
+            sensors: true,
+            thresholds: true,
+            targets: true,
+          },
+        });
 
         const prompt = ChatPromptTemplate.fromMessages([
           ['system', systemPrompt],
@@ -291,13 +465,22 @@ Respond concisely and provide actionable insights.`;
           ['placeholder', '{agent_scratchpad}'],
         ]);
 
+        yield* this.logger.debug('⚙️ Creating LangChain agent', {
+          toolsAvailable: tools.map((t) => ({ name: t.name, description: t.description })),
+          llmModel: 'gpt-4o-mini',
+        });
+
         const agent = yield* Effect.tryPromise({
-          try: () => createToolCallingAgent({
-            llm,
-            tools,
-            prompt,
-          }),
-          catch: (error) => ErrorUtils.aiError(`Failed to create agent: ${error}`),
+          try: () =>
+            Promise.resolve(
+              createToolCallingAgent({
+                llm: llm as never,
+                tools,
+                prompt,
+              }),
+            ),
+          catch: (error) =>
+            ErrorUtils.aiError(`Failed to create agent: ${error}`),
         });
 
         const executor = new AgentExecutor({
@@ -315,21 +498,36 @@ Respond concisely and provide actionable insights.`;
           agent: executor,
         }));
 
-        yield* this.logger.info('AI agent initialized successfully');
-
-      }).bind(this)(),
-      Effect.catchAll((error) =>
-        pipe(
-          this.logger.error('Failed to initialize AI agent', error),
-          Effect.andThen(Effect.fail(error))
-        )
-      )
+        const initTime = Date.now() - initStart;
+        yield* this.logger.info('✅ AI agent initialized successfully', {
+          initializationTimeMs: initTime,
+          maxIterations: 10,
+          verboseMode: this.appOptions.logLevel === 'debug',
+          toolsRegistered: tools.length,
+          agentReady: true,
+        });
+      }).bind(this)),
+      Effect.catchAll((error) => {
+        const initTime = Date.now() - initStart;
+        return pipe(
+          this.logger.error('❌ Failed to initialize AI agent', error, {
+            initializationTimeMs: initTime,
+            errorType: error instanceof Error ? error.name : 'Unknown',
+            hasApiKey: !!this.appOptions.openaiApiKey,
+            toolsCount: 3,
+          }),
+          Effect.andThen(Effect.fail(error)),
+        );
+      }),
     );
+  };
 
   /**
    * Process temperature change events
    */
-  processTemperatureChange = (event: TemperatureChangeEvent): Effect.Effect<OperationResult, AIError> =>
+  processTemperatureChange = (
+    event: TemperatureChangeEvent,
+  ): Effect.Effect<OperationResult, AIError> =>
     pipe(
       this.stateRef,
       Ref.get,
@@ -345,7 +543,9 @@ Respond concisely and provide actionable insights.`;
             oldState: event.oldState,
           }),
           Effect.andThen(() => {
-            const input = `Temperature sensor ${event.entityId} changed from ${event.oldState || 'unknown'} to ${event.newState} at ${event.timestamp}. 
+            const input = `Temperature sensor ${event.entityId} changed from ${
+              event.oldState || 'unknown'
+            } to ${event.newState} at ${event.timestamp}.
 
 Please analyze this change and determine if any HVAC action is needed. Consider:
 1. Current system status and mode
@@ -356,11 +556,13 @@ Please analyze this change and determine if any HVAC action is needed. Consider:
 If action is needed, execute the appropriate HVAC control.`;
 
             return Effect.tryPromise({
-              try: () => state.agent!.invoke({
-                input,
-                chat_history: state.conversationHistory,
-              }),
-              catch: (error) => ErrorUtils.aiError(`Temperature processing failed: ${error}`),
+              try: () =>
+                state.agent!.invoke({
+                  input,
+                  chat_history: state.conversationHistory,
+                }),
+              catch: (error) =>
+                ErrorUtils.aiError(`Temperature processing failed: ${error}`),
             });
           }),
           Effect.flatMap((result) =>
@@ -373,12 +575,12 @@ If action is needed, execute the appropriate HVAC control.`;
                   steps: result.intermediateSteps?.length || 0,
                 },
                 timestamp: new Date().toISOString(),
-              }))
+              })),
             )
           ),
           Effect.tap(() =>
             this.logger.info('AI temperature change processing completed')
-          )
+          ),
         );
       }),
       Effect.catchAll((error) =>
@@ -388,15 +590,18 @@ If action is needed, execute the appropriate HVAC control.`;
             success: false,
             error: error instanceof Error ? error.message : String(error),
             timestamp: new Date().toISOString(),
-          }))
+          })),
         )
-      )
+      ),
     );
 
   /**
    * Handle manual override requests
    */
-  manualOverride = (action: string, options: Record<string, unknown> = {}): Effect.Effect<OperationResult, AIError> =>
+  manualOverride = (
+    action: string,
+    options: Record<string, unknown> = {},
+  ): Effect.Effect<OperationResult, AIError> =>
     pipe(
       this.stateRef,
       Ref.get,
@@ -405,10 +610,22 @@ If action is needed, execute the appropriate HVAC control.`;
           return Effect.fail(ErrorUtils.aiError('AI agent not initialized'));
         }
 
+        const overrideStart = Date.now();
         return pipe(
-          this.logger.info('AI processing manual override', { action, options }),
+          this.logger.info('🎯 AI processing manual override request', {
+            action,
+            options,
+            hasTemperature: options.temperature !== undefined,
+            requestedTemperature: options.temperature,
+            conversationHistoryLength: state.conversationHistory.length,
+          }),
           Effect.andThen(() => {
-            const input = `User requested manual HVAC override: action="${action}"${options.temperature ? `, temperature=${options.temperature}°C` : ''}.
+            const input =
+              `User requested manual HVAC override: action="${action}"${
+                options.temperature
+                  ? `, temperature=${options.temperature}°C`
+                  : ''
+              }.
 
 Please:
 1. Validate this request against current conditions and thresholds
@@ -416,35 +633,58 @@ Please:
 3. Execute the HVAC control if appropriate
 4. Provide feedback on the action and any recommendations
 
-Use the hvac_control tool to execute the override: {"action": "${action}"${options.temperature ? `, "temperature": ${options.temperature}` : ''}}.`;
+Use the hvac_control tool to execute the override: {"action": "${action}"${
+                options.temperature
+                  ? `, "temperature": ${options.temperature}`
+                  : ''
+              }}.`;
 
             return Effect.tryPromise({
-              try: () => state.agent!.invoke({
-                input,
-                chat_history: state.conversationHistory,
-              }),
-              catch: (error) => ErrorUtils.aiError(`Manual override failed: ${error}`),
+              try: () =>
+                state.agent!.invoke({
+                  input,
+                  chat_history: state.conversationHistory,
+                }),
+              catch: (error) =>
+                ErrorUtils.aiError(`Manual override failed: ${error}`),
             });
           }),
           Effect.flatMap((result) =>
             pipe(
               this.updateConversationHistory(`manual_override_${action}`, result.output),
-              Effect.map(() => ({
-                success: true,
-                data: {
-                  aiResponse: result.output,
-                  action,
-                  options,
-                },
-                timestamp: new Date().toISOString(),
-              }))
+              Effect.map(() => {
+                const overrideTime = Date.now() - overrideStart;
+                return {
+                  success: true,
+                  data: {
+                    aiResponse: result.output,
+                    action,
+                    options,
+                    steps: result.intermediateSteps?.length || 0,
+                    toolsUsed: result.intermediateSteps?.map((step: any) => step.action?.tool) || [],
+                    overrideTimeMs: overrideTime,
+                    validationResult: !result.output.toLowerCase().includes('error') ? 'approved' : 'rejected'
+                  },
+                  timestamp: new Date().toISOString(),
+                };
+              }),
             )
           ),
-          Effect.tap(() =>
-            this.logger.info('AI manual override completed', { action })
-          )
+          Effect.tap((result) =>
+            this.logger.info('✅ AI manual override completed', {
+              action,
+              options,
+              output: result.data.aiResponse.substring(0, 150) + (result.data.aiResponse.length > 150 ? '...' : ''),
+              outputLength: result.data.aiResponse.length,
+              intermediateSteps: result.data.steps,
+              overrideTimeMs: result.data.overrideTimeMs,
+              toolsUsed: result.data.toolsUsed,
+              validationPassed: result.data.validationResult === 'approved',
+              conversationLength: state.conversationHistory.length
+            })
+          ),
         );
-      })
+      }),
     );
 
   /**
@@ -462,7 +702,8 @@ Use the hvac_control tool to execute the override: {"action": "${action}"${optio
         return pipe(
           this.logger.info('AI evaluating system efficiency'),
           Effect.andThen(() => {
-            const input = `Please analyze the current HVAC system efficiency and performance.
+            const input =
+              `Please analyze the current HVAC system efficiency and performance.
 
 Steps:
 1. Get current temperatures using get_temperature tool
@@ -477,16 +718,21 @@ Steps:
 Please provide a comprehensive analysis with actionable recommendations.`;
 
             return Effect.tryPromise({
-              try: () => state.agent!.invoke({
-                input,
-                chat_history: state.conversationHistory,
-              }),
-              catch: (error) => ErrorUtils.aiError(`Efficiency evaluation failed: ${error}`),
+              try: () =>
+                state.agent!.invoke({
+                  input,
+                  chat_history: state.conversationHistory,
+                }),
+              catch: (error) =>
+                ErrorUtils.aiError(`Efficiency evaluation failed: ${error}`),
             });
           }),
           Effect.flatMap((result) =>
             pipe(
-              this.updateConversationHistory('efficiency_evaluation', result.output),
+              this.updateConversationHistory(
+                'efficiency_evaluation',
+                result.output,
+              ),
               Effect.map(() => ({
                 success: true,
                 data: {
@@ -494,14 +740,14 @@ Please provide a comprehensive analysis with actionable recommendations.`;
                   recommendations: this.extractRecommendations(result.output),
                 },
                 timestamp: new Date().toISOString(),
-              }))
+              })),
             )
           ),
           Effect.tap(() =>
             this.logger.info('AI efficiency evaluation completed')
-          )
+          ),
         );
-      })
+      }),
     );
 
   /**
@@ -522,7 +768,8 @@ Please provide a comprehensive analysis with actionable recommendations.`;
         return pipe(
           this.logger.debug('AI generating status summary'),
           Effect.andThen(() => {
-            const input = `Please provide a brief status summary of the HVAC system.
+            const input =
+              `Please provide a brief status summary of the HVAC system.
 
 Steps:
 1. Get current temperatures
@@ -535,10 +782,11 @@ Steps:
 Keep the summary brief and informative.`;
 
             return Effect.tryPromise({
-              try: () => state.agent!.invoke({
-                input,
-                chat_history: state.conversationHistory.slice(-6), // Limited history for status
-              }),
+              try: () =>
+                state.agent!.invoke({
+                  input,
+                  chat_history: state.conversationHistory.slice(-6), // Limited history for status
+                }),
               catch: (error) => error,
             });
           }),
@@ -553,11 +801,11 @@ Keep the summary brief and informative.`;
               Effect.andThen(Effect.succeed({
                 success: false,
                 error: error instanceof Error ? error.message : String(error),
-              }))
+              })),
             )
-          )
+          ),
         );
-      })
+      }),
     );
 
   /**
@@ -567,7 +815,7 @@ Keep the summary brief and informative.`;
     pipe(
       this.stateRef,
       Ref.update((state) => ({ ...state, conversationHistory: [] })),
-      Effect.andThen(this.logger.debug('AI conversation history cleared'))
+      Effect.andThen(this.logger.debug('AI conversation history cleared')),
     );
 
   /**
@@ -577,27 +825,32 @@ Keep the summary brief and informative.`;
     pipe(
       this.stateRef,
       Ref.get,
-      Effect.map((state) => state.conversationHistory.length)
+      Effect.map((state) => state.conversationHistory.length),
     );
 
   /**
    * Update conversation history
    */
-  private updateConversationHistory = (inputKey: string, output: string): Effect.Effect<void, never> =>
+  private updateConversationHistory = (
+    input: string,
+    output: string,
+  ): Effect.Effect<void, never> =>
     pipe(
       this.stateRef,
       Ref.update((state) => {
         const newHistory = [
           ...state.conversationHistory,
-          new HumanMessage(`${inputKey}: processing`),
+          new HumanMessage(input),
           new AIMessage(output),
         ];
 
         // Keep conversation history manageable
-        const managedHistory = newHistory.length > 20 ? newHistory.slice(-20) : newHistory;
+        const managedHistory = newHistory.length > 20
+          ? newHistory.slice(-20)
+          : newHistory;
 
         return { ...state, conversationHistory: managedHistory };
-      })
+      }),
     );
 
   /**
@@ -605,30 +858,34 @@ Keep the summary brief and informative.`;
    */
   private extractRecommendations = (text: string): string[] => {
     const recommendations: string[] = [];
-    
+
     // Look for bullet points or numbered lists
     const bulletRegex = /(?:^|\n)[•\-\*]\s*(.+)/g;
     const numberedRegex = /(?:^|\n)\d+\.\s*(.+)/g;
-    
+
     let match;
     while ((match = bulletRegex.exec(text)) !== null) {
       recommendations.push(match[1].trim());
     }
-    
+
     while ((match = numberedRegex.exec(text)) !== null) {
       recommendations.push(match[1].trim());
     }
-    
+
     // If no structured recommendations found, look for sentences with recommendation keywords
     if (recommendations.length === 0) {
       const sentences = text.split(/[.!?]\s+/);
       for (const sentence of sentences) {
-        if (/\b(recommend|suggest|should|consider|optimize|improve)\b/i.test(sentence)) {
+        if (
+          /\b(recommend|suggest|should|consider|optimize|improve)\b/i.test(
+            sentence,
+          )
+        ) {
           recommendations.push(sentence.trim());
         }
       }
     }
-    
+
     return recommendations.slice(0, 5); // Limit to 5 recommendations
   };
 }
@@ -639,31 +896,31 @@ Keep the summary brief and informative.`;
 export const HVACAgentLive = Layer.effect(
   HVACAgent,
   Effect.gen(function* () {
-    const hvacOptions = yield* Context.Tag<HvacOptions>('HvacOptions');
-    const appOptions = yield* Context.Tag<ApplicationOptions>('ApplicationOptions');
+    const hvacOptions = yield* HvacOptionsService;
+    const appOptions = yield* ApplicationOptionsService;
     const stateMachine = yield* HVACStateMachine;
     const haClient = yield* HomeAssistantClient;
     const logger = yield* LoggerService;
-    
+
     const initialState: AgentState = {
       tools: [],
       conversationHistory: [],
     };
-    
+
     const stateRef = yield* Ref.make(initialState);
-    
+
     const impl = new HVACAgentImpl(
       hvacOptions,
       appOptions,
       stateMachine,
       haClient,
       logger,
-      stateRef
+      stateRef,
     );
-    
+
     // Initialize the agent
     yield* impl.initializeAgent();
-    
+
     return HVACAgent.of({
       processTemperatureChange: impl.processTemperatureChange,
       manualOverride: impl.manualOverride,
@@ -672,5 +929,5 @@ export const HVACAgentLive = Layer.effect(
       clearHistory: impl.clearHistory,
       getHistoryLength: impl.getHistoryLength,
     });
-  })
+  }),
 );

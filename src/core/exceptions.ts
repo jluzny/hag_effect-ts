@@ -133,4 +133,46 @@ export const ErrorUtils = {
    */
   aiError: (message: string, model?: string, context?: string): AIError =>
     new AIError({ message, model, context }),
+
+  /**
+   * Extract details from an unknown error or Effect Cause.
+   */
+  extractErrorDetails: (error: unknown): {
+    message: string;
+    name: string;
+    code?: string;
+    stack?: string;
+    cause?: unknown;
+  } => {
+    if (error instanceof HAGError) {
+      return {
+        message: error.message,
+        name: error._tag,
+        code: error.code,
+        stack: (error.cause instanceof Error) ? error.cause.stack : undefined,
+        cause: error.cause,
+      };
+    } else if (error instanceof Error) {
+      return {
+        message: error.message,
+        name: error.name,
+        stack: error.stack,
+        cause: undefined,
+      };
+    } else if (typeof error === 'object' && error !== null && '_tag' in error && 'message' in error) {
+      // Handle other Effect TaggedErrors
+      return {
+        message: (error as any).message,
+        name: (error as any)._tag,
+        stack: ((error as any).cause instanceof Error) ? (error as any).cause.stack : undefined,
+        cause: (error as any).cause,
+      };
+    }
+    return {
+      message: String(error),
+      name: 'UnknownError',
+      stack: undefined,
+      cause: undefined,
+    };
+  },
 } as const;

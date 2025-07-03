@@ -4,11 +4,12 @@
  * Effect-native configuration loading with proper error handling and validation.
  */
 
-import { Effect, Config, Layer, pipe } from 'effect';
+import { Effect, Layer, pipe } from 'effect';
+import * as Config from 'effect/Config';
 import * as ParseResult from '@effect/schema/ParseResult';
 import { parse } from 'yaml';
 import { join } from '@std/path';
-import { SettingsSchema, Settings, DefaultSettings } from './settings.ts';
+import { SettingsSchema, Settings, DefaultSettings } from './settings_simple.ts';
 import { ConfigurationError, ErrorUtils } from '../core/exceptions.ts';
 
 /**
@@ -103,7 +104,7 @@ const loadEnvironment = (): Effect.Effect<void, never> =>
     Effect.tryPromise({
       try: async () => {
         const { load } = await import('@std/dotenv');
-        await load({ export: true, allowEmptyValues: true });
+        await load({ export: true });
       },
       catch: (error) => error,
     }),
@@ -158,7 +159,7 @@ const loadConfigFile = (configPath: string): Effect.Effect<unknown, Configuratio
     }),
     Effect.flatMap((configText) =>
       Effect.try({
-        try: () => parse(configText),
+        try: () => parse(resolveEnvironmentVariables(configText)),
         catch: (error) => ErrorUtils.configError(
           `Failed to parse YAML configuration: ${error}`,
           'config_file',
@@ -166,8 +167,8 @@ const loadConfigFile = (configPath: string): Effect.Effect<unknown, Configuratio
         ),
       })
     ),
-    Effect.catchTag('UnknownException', (error) => {
-      if (error.error instanceof Deno.errors.NotFound) {
+    Effect.catchAll((error: unknown) => {
+      if ((error as { error?: unknown }).error instanceof Deno.errors.NotFound) {
         return Effect.fail(
           ErrorUtils.configError(
             `Configuration file not found: ${configPath}`,
@@ -178,8 +179,7 @@ const loadConfigFile = (configPath: string): Effect.Effect<unknown, Configuratio
       }
       return Effect.fail(
         ErrorUtils.configError(
-          `Failed to read configuration file: ${error.error}`,
-          'config_file',
+          `Failed to read configuration file: ${(error as { error?: unknown }).error}`,'config_file',
           configPath
         )
       );
@@ -187,59 +187,45 @@ const loadConfigFile = (configPath: string): Effect.Effect<unknown, Configuratio
   );
 
 /**
+ * Resolve environment variable placeholders in configuration text
+ */
+const resolveEnvironmentVariables = (configText: string): string => {
+  const envVarPattern = /\$\{([^}]+)\}/g;
+  return configText.replace(envVarPattern, (match, envVarName) => {
+    const envValue = Deno.env.get(envVarName);
+    if (envValue === undefined) {
+      Effect.logWarning(`Environment variable not found: ${envVarName}`).pipe(Effect.runSync);
+      return match; // Keep the placeholder if not found
+    }
+    return envValue;
+  });
+};
+
+/**
  * Merge configuration with default values
  */
 const mergeWithDefaults = (config: unknown): Effect.Effect<unknown, never> =>
   Effect.sync(() => {
-    if (typeof config !== 'object' || config === null) {
-      return {
-        appOptions: DefaultSettings.appOptions(),
-        hassOptions: DefaultSettings.hassOptions('', '', ''),
-        hvacOptions: {
-          tempSensor: '',
-          outdoorSensor: 'sensor.openweathermap_temperature',
-          systemMode: 'auto',
-          hvacEntities: [],
-          heating: {
-            temperature: 21.0,
-            presetMode: 'comfort',
-            temperatureThresholds: DefaultSettings.temperatureThresholds(19.7, 20.2, -10.0, 15.0),
-          },
-          cooling: {
-            temperature: 24.0,
-            presetMode: 'eco',
-            temperatureThresholds: DefaultSettings.temperatureThresholds(23.5, 25.0, 10.0, 45.0),
-          },
-        },
-      };
-    }
+    const deepMerge = (target: any, source: any) => {
+      const output = { ...target };
 
-    const configObj = config as Record<string, unknown>;
-    const appOptions = { ...DefaultSettings.appOptions(), ...(configObj.appOptions as Record<string, unknown> ?? {}) };
-    const hassOptions = { ...DefaultSettings.hassOptions('', '', ''), ...(configObj.hassOptions as Record<string, unknown> ?? {}) };
-    const hvacOptionsBase = configObj.hvacOptions as Record<string, unknown> ?? {};
-    
-    const hvacOptions = {
-      tempSensor: hvacOptionsBase.tempSensor || '',
-      outdoorSensor: hvacOptionsBase.outdoorSensor || 'sensor.openweathermap_temperature',
-      systemMode: hvacOptionsBase.systemMode || 'auto',
-      hvacEntities: hvacOptionsBase.hvacEntities || [],
-      heating: {
-        temperature: 21.0,
-        presetMode: 'comfort',
-        temperatureThresholds: DefaultSettings.temperatureThresholds(19.7, 20.2, -10.0, 15.0),
-        ...(hvacOptionsBase.heating as Record<string, unknown> ?? {}),
-      },
-      cooling: {
-        temperature: 24.0,
-        presetMode: 'eco',
-        temperatureThresholds: DefaultSettings.temperatureThresholds(23.5, 25.0, 10.0, 45.0),
-        ...(hvacOptionsBase.cooling as Record<string, unknown> ?? {}),
-      },
-      activeHours: hvacOptionsBase.activeHours,
+      if (target && typeof target === 'object' && source && typeof source === 'object') {
+        Object.keys(source).forEach(key => {
+          if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key]) && target[key] && typeof target[key] === 'object' && !Array.isArray(target[key])) {
+            output[key] = deepMerge(target[key], source[key]);
+          } else {
+            output[key] = source[key];
+          }
+        });
+      }
+      return output;
     };
 
-    return { appOptions, hassOptions, hvacOptions };
+    if (typeof config !== 'object' || config === null) {
+      return DefaultSettings;
+    }
+
+    return deepMerge(DefaultSettings, config);
   });
 
 /**
@@ -263,12 +249,16 @@ const applyEnvironmentOverrides = (config: unknown): Effect.Effect<unknown, neve
     if (Deno.env.get('HAG_LOG_LEVEL')) appOptions.logLevel = Deno.env.get('HAG_LOG_LEVEL');
     if (Deno.env.get('HAG_USE_AI')) appOptions.useAi = Deno.env.get('HAG_USE_AI') === 'true';
     if (Deno.env.get('HAG_AI_MODEL')) appOptions.aiModel = Deno.env.get('HAG_AI_MODEL');
+    if (Deno.env.get('OPENAI_API_KEY')) appOptions.openaiApiKey = Deno.env.get('OPENAI_API_KEY');
+    if (Deno.env.get('HAG_DRY_RUN')) appOptions.dryRun = Deno.env.get('HAG_DRY_RUN') === 'true';
 
     // HVAC options
     const hvacOptions = { ...(configObj.hvacOptions as Record<string, unknown> ?? {}) };
     if (Deno.env.get('HAG_TEMP_SENSOR')) hvacOptions.tempSensor = Deno.env.get('HAG_TEMP_SENSOR');
     if (Deno.env.get('HAG_OUTDOOR_SENSOR')) hvacOptions.outdoorSensor = Deno.env.get('HAG_OUTDOOR_SENSOR');
     if (Deno.env.get('HAG_SYSTEM_MODE')) hvacOptions.systemMode = Deno.env.get('HAG_SYSTEM_MODE');
+    if (Deno.env.get('HAG_HEATING_TEMPERATURE')) hvacOptions.heating = { ...(hvacOptions.heating as Record<string, unknown> ?? {}), temperature: parseFloat(Deno.env.get('HAG_HEATING_TEMPERATURE')!) };
+    if (Deno.env.get('HAG_COOLING_TEMPERATURE')) hvacOptions.cooling = { ...(hvacOptions.cooling as Record<string, unknown> ?? {}), temperature: parseFloat(Deno.env.get('HAG_COOLING_TEMPERATURE')!) };
 
     return { ...configObj, hassOptions, appOptions, hvacOptions };
   });
@@ -281,7 +271,7 @@ const validateConfiguration = (config: unknown): Effect.Effect<Settings, Configu
     ParseResult.decodeUnknown(SettingsSchema)(config),
     Effect.mapError((parseError) =>
       ErrorUtils.configError(
-        `Configuration validation failed: ${ParseResult.TreeFormatter.formatError(parseError)}`,
+        `Configuration validation failed: ${parseError.toString()}`,
         'validation',
         config
       )
@@ -291,13 +281,11 @@ const validateConfiguration = (config: unknown): Effect.Effect<Settings, Configu
 /**
  * Configuration Layer for dependency injection
  */
-export const ConfigLayer = Layer.effect(
-  Config.Config,
+export const ConfigLayer = Layer.effectDiscard(
   pipe(
     Config.string('HAG_CONFIG_FILE').pipe(Config.withDefault('')),
     Effect.flatMap((configPath) =>
       ConfigLoader.loadSettings(configPath.length > 0 ? configPath : undefined)
-    ),
-    Effect.map((settings) => Config.succeed(settings))
+    )
   )
 );

@@ -2,19 +2,14 @@
  * Unit tests for configuration schemas in HAG Effect-TS variant.
  */
 
-import { assertEquals, assertThrows } from '@std/assert';
+import { assertEquals, assertThrows as _assertThrows } from '@std/assert';
 import { Effect, Exit } from 'effect';
 import { Schema as S, ParseResult } from '@effect/schema';
-import {
-  HassOptionsSchema,
-  HvacOptionsSchema,
-  ApplicationOptionsSchema,
-  SettingsSchema,
-  SystemMode,
-  LogLevel,
-  type Settings,
-  type HvacOptions,
-} from '../../../src/config/settings.ts';
+import { ApplicationOptionsSchema, HassOptionsSchema, HvacOptionsSchema, SettingsSchema } from '../../../src/config/settings_simple.ts';
+import { LogLevel, SystemMode } from '../../../src/types/common.ts';
+
+// Re-export types to avoid lint errors
+export type { Settings as _Settings, HvacOptions as _HvacOptions } from '../../../src/config/settings_simple.ts';
 
 Deno.test('HassOptionsSchema', async (t) => {
   await t.step('should validate valid Home Assistant config', async () => {

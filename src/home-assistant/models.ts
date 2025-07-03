@@ -6,7 +6,7 @@
 
 import { Data } from 'effect';
 import { HassState, HassEvent, HassStateChangeData, HassServiceCall, WebSocketMessage } from '../types/common.ts';
-import { ValidationError, ErrorUtils } from '../core/exceptions.ts';
+import { ValidationError as _ValidationError, ErrorUtils } from '../core/exceptions.ts';
 
 /**
  * Home Assistant authentication response
@@ -37,11 +37,16 @@ export type HassCommandType = typeof HassCommandType[keyof typeof HassCommandTyp
  * Enhanced WebSocket message with HAG-specific properties
  */
 export interface HagWebSocketMessage extends WebSocketMessage {
-  readonly success?: boolean;
-  readonly result?: unknown;
-  readonly error?: {
-    readonly code: string;
-    readonly message: string;
+  success?: boolean;
+  result?: unknown;
+  error?: {
+    code: string;
+    message: string;
+  };
+  target?: {
+    entity_id?: string | readonly string[];
+    device_id?: string | readonly string[];
+    area_id?: string | readonly string[];
   };
 }
 
